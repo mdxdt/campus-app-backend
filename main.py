@@ -234,4 +234,15 @@ def get_all_users(user_id: int = Depends(get_current_user)):
     
     return result
 
+@app.delete("/account")
+def delete_account(user_id: int = Depends(get_current_user)):
+    """Permanently delete the current user's account and all their data."""
+    conn = get_db()
+    conn.execute("DELETE FROM campus_status WHERE user_id = ?", (user_id,))
+    conn.execute("DELETE FROM sessions WHERE user_id = ?", (user_id,))
+    conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+    return {"message": "Account deleted."}
+
 # Run with: uvicorn main:app --reload
