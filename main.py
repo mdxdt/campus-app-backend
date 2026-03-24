@@ -12,6 +12,14 @@ import secrets
 import time
 import os
 from datetime import datetime
+import pytz
+
+# All schedule times are interpreted in Melbourne time
+APP_TZ = pytz.timezone("Australia/Melbourne")
+
+def now_melbourne():
+    """Return the current datetime in Melbourne time."""
+    return datetime.now(APP_TZ)
 
 # ---------- DATABASE ----------
 
@@ -79,31 +87,45 @@ def init_db():
 
 def run_schedule_tick():
     """
-    Runs every minute. For every user:
-    - If they have a schedule slot active RIGHT NOW → set ON, expiry = slot end time
-    - If they were schedule-managed and no slot is active → set OFF
-    This also handles expiry correctly by writing it from the schedule,
-    not relying on the client to notice.
+    Runs every minute on the server.
+    All times are compared in Melbourne local time (Australia/Melbourne).
+    - Turns ON anyone whose schedule slot is currently active.
+    - Turns OFF anyone who was schedule-managed and whose slot has ended.
+    - Turns OFF anyone whose manual timer has expired.
     """
-    now = datetime.utcnow()
-    # day_of_week: Python's weekday() is 0=Monday which matches our schema
-    today_dow = now.weekday()
+    now = now_melbourne()
+    today_dow = now.weekday()           # 0=Monday, matches our schema
     today_str = now.strftime("%Y-%m-%d")
     current_time = now.strftime("%H:%M")
     unix_now = time.time()
+
+    print(f"[scheduler] tick — Melbourne time: {now.strftime('%A %H:%M')} (dow={today_dow})")
 
     try:
         conn = get_db()
         cur = conn.cursor()
 
-        # Get all users
+        # Step 1 — expire manual timers that have run out
+        cur.execute("""
+            UPDATE campus_status
+            SET is_on_campus = FALSE,
+                expires_at = NULL,
+                updated_at = %s,
+                schedule_managed = FALSE
+            WHERE is_on_campus = TRUE
+              AND schedule_managed = FALSE
+              AND expires_at IS NOT NULL
+              AND expires_at <= %s
+        """, (unix_now, unix_now))
+
+        # Step 2 — process every user's schedule
         cur.execute("SELECT id FROM users")
         users = cur.fetchall()
 
         for user in users:
             uid = user["id"]
 
-            # Find any schedule slot that is active for this user right now
+            # Find any slot active right now for this user (in Melbourne time)
             cur.execute("""
                 SELECT start_time, end_time, is_recurring, specific_date
                 FROM schedule
@@ -121,45 +143,56 @@ def run_schedule_tick():
                     break
 
             if active_slot:
-                # Calculate exact Unix timestamp for end of this slot today (UTC)
+                # Calculate the Unix timestamp for when this slot ends,
+                # using Melbourne time so the expiry lines up correctly
                 end_h, end_m = map(int, active_slot["end_time"].split(":"))
                 end_dt = now.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
-                expires_at = end_dt.timestamp()
+                expires_at = end_dt.timestamp()  # timestamp() respects tzinfo → correct UTC epoch
 
-                cur.execute("""
-                    INSERT INTO campus_status (user_id, is_on_campus, expires_at, updated_at, schedule_managed)
-                    VALUES (%s, TRUE, %s, %s, TRUE)
-                    ON CONFLICT (user_id) DO UPDATE SET
-                        is_on_campus = TRUE,
-                        expires_at = EXCLUDED.expires_at,
-                        updated_at = EXCLUDED.updated_at,
-                        schedule_managed = TRUE
-                    WHERE campus_status.schedule_managed = TRUE
-                       OR campus_status.is_on_campus = FALSE
-                """, (uid, expires_at, unix_now))
+                # Don't override a manual ON (schedule_managed=FALSE, is_on_campus=TRUE)
+                cur.execute(
+                    "SELECT is_on_campus, schedule_managed FROM campus_status WHERE user_id = %s",
+                    (uid,)
+                )
+                current = cur.fetchone()
+
+                should_turn_on = (
+                    current is None or
+                    not current["is_on_campus"] or
+                    current["schedule_managed"]
+                )
+
+                if should_turn_on:
+                    cur.execute("""
+                        INSERT INTO campus_status (user_id, is_on_campus, expires_at, updated_at, schedule_managed)
+                        VALUES (%s, TRUE, %s, %s, TRUE)
+                        ON CONFLICT (user_id) DO UPDATE SET
+                            is_on_campus = TRUE,
+                            expires_at = EXCLUDED.expires_at,
+                            updated_at = EXCLUDED.updated_at,
+                            schedule_managed = TRUE
+                    """, (uid, expires_at, unix_now))
+                    print(f"[scheduler] user {uid} → ON until {active_slot['end_time']} Melbourne time")
+
             else:
-                # No active slot — if the scheduler was managing this user, turn them off
+                # No active slot — turn off if the scheduler was managing them
                 cur.execute("""
                     UPDATE campus_status
-                    SET is_on_campus = FALSE, expires_at = NULL, updated_at = %s, schedule_managed = FALSE
+                    SET is_on_campus = FALSE,
+                        expires_at = NULL,
+                        updated_at = %s,
+                        schedule_managed = FALSE
                     WHERE user_id = %s
+                      AND is_on_campus = TRUE
                       AND schedule_managed = TRUE
-                      AND is_on_campus = TRUE
                 """, (unix_now, uid))
-
-                # Also expire anyone whose manual timer has run out
-                cur.execute("""
-                    UPDATE campus_status
-                    SET is_on_campus = FALSE, expires_at = NULL, updated_at = %s
-                    WHERE user_id = %s
-                      AND is_on_campus = TRUE
-                      AND expires_at IS NOT NULL
-                      AND expires_at <= %s
-                """, (unix_now, uid, unix_now))
+                if cur.rowcount:
+                    print(f"[scheduler] user {uid} → OFF (slot ended)")
 
         conn.commit()
         cur.close()
         conn.close()
+
     except Exception as e:
         print(f"[scheduler] error: {e}")
 
@@ -170,7 +203,7 @@ async def lifespan(app: FastAPI):
     init_db()
     scheduler = BackgroundScheduler()
     # Run every minute, starting immediately
-    scheduler.add_job(run_schedule_tick, "interval", minutes=1, next_run_time=datetime.now())
+    scheduler.add_job(run_schedule_tick, "interval", minutes=1, next_run_time=now_melbourne())
     scheduler.start()
     print("[scheduler] started — checking schedules every minute")
     yield
