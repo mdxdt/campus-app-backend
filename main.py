@@ -95,6 +95,8 @@ def init_db():
 
 # ---------- SCHEDULER ----------
 
+CAMPUS_TIMEOUT_SECONDS = 24 * 60 * 60  # 24 hour hard cap
+
 def run_schedule_tick():
     """
     Runs every minute in Melbourne time.
@@ -157,7 +159,7 @@ def run_schedule_tick():
             if active_slot:
                 end_h, end_m = map(int, active_slot["end_time"].split(":"))
                 end_dt = now.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
-                expires_at = end_dt.timestamp()
+                expires_at = min(end_dt.timestamp(), unix_now + CAMPUS_TIMEOUT_SECONDS)
 
                 if status and status["manual_override_off"]:
                     # User manually went OFF during this slot — respect it, just keep expiry updated
@@ -337,11 +339,8 @@ def delete_account(user_id: int = Depends(get_current_user)):
 @app.post("/status")
 def update_status(req: StatusUpdateRequest, user_id: int = Depends(get_current_user)):
     now_unix = time.time()
-    expires_at = None
-    if req.is_on_campus and req.duration_minutes:
-        expires_at = now_unix + req.duration_minutes * 60
 
-    # Check if currently in a scheduled slot
+    # Check if currently in a scheduled slot (Melbourne time)
     now = now_melbourne()
     today_dow = now.weekday()
     today_str = now.strftime("%Y-%m-%d")
@@ -353,25 +352,25 @@ def update_status(req: StatusUpdateRequest, user_id: int = Depends(get_current_u
         WHERE user_id = %s AND day_of_week = %s AND start_time <= %s AND end_time > %s
     """, (user_id, today_dow, current_time, current_time))
     slots = cur.fetchall()
-    in_scheduled_slot = any(s["is_recurring"] or s["specific_date"] == today_str for s in slots)
+    active_slot = next((s for s in slots if s["is_recurring"] or s["specific_date"] == today_str), None)
+    in_scheduled_slot = active_slot is not None
 
     if not req.is_on_campus and in_scheduled_slot:
-        # Manual OFF during scheduled time — set override flag so scheduler won't re-enable
+        # Manual OFF during scheduled time — set override flag, scheduler won't re-enable
         cur.execute("""
             INSERT INTO campus_status (user_id, is_on_campus, expires_at, updated_at, schedule_managed, manual_override_off)
-            VALUES (%s, FALSE, %s, %s, FALSE, TRUE)
+            VALUES (%s, FALSE, NULL, %s, FALSE, TRUE)
             ON CONFLICT (user_id) DO UPDATE SET
-                is_on_campus = FALSE, expires_at = EXCLUDED.expires_at,
+                is_on_campus = FALSE, expires_at = NULL,
                 updated_at = EXCLUDED.updated_at, schedule_managed = FALSE, manual_override_off = TRUE
-        """, (user_id, expires_at, now_unix))
+        """, (user_id, now_unix))
+
     elif req.is_on_campus and in_scheduled_slot:
-        # Manual ON during scheduled time — hand back to scheduler
-        # Find slot end time for expiry
-        active_slot = next((s for s in slots if s["is_recurring"] or s["specific_date"] == today_str), None)
-        if active_slot:
-            end_h, end_m = map(int, active_slot["end_time"].split(":"))
-            end_dt = now.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
-            expires_at = end_dt.timestamp()
+        # Manual ON during scheduled time — clear override, hand back to scheduler
+        # Use the slot's end time as expiry (no new schedule entry created)
+        end_h, end_m = map(int, active_slot["end_time"].split(":"))
+        end_dt = now.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
+        expires_at = min(end_dt.timestamp(), now_unix + CAMPUS_TIMEOUT_SECONDS)
         cur.execute("""
             INSERT INTO campus_status (user_id, is_on_campus, expires_at, updated_at, schedule_managed, manual_override_off)
             VALUES (%s, TRUE, %s, %s, TRUE, FALSE)
@@ -379,15 +378,29 @@ def update_status(req: StatusUpdateRequest, user_id: int = Depends(get_current_u
                 is_on_campus = TRUE, expires_at = EXCLUDED.expires_at,
                 updated_at = EXCLUDED.updated_at, schedule_managed = TRUE, manual_override_off = FALSE
         """, (user_id, expires_at, now_unix))
-    else:
-        # Outside scheduled time — manual full control, scheduler won't touch
+
+    elif req.is_on_campus:
+        # Manual ON outside scheduled time — cap at 24 hours
+        expires_at = now_unix + CAMPUS_TIMEOUT_SECONDS
+        if req.duration_minutes:
+            expires_at = min(now_unix + req.duration_minutes * 60, now_unix + CAMPUS_TIMEOUT_SECONDS)
         cur.execute("""
             INSERT INTO campus_status (user_id, is_on_campus, expires_at, updated_at, schedule_managed, manual_override_off)
-            VALUES (%s, %s, %s, %s, FALSE, FALSE)
+            VALUES (%s, TRUE, %s, %s, FALSE, FALSE)
             ON CONFLICT (user_id) DO UPDATE SET
-                is_on_campus = EXCLUDED.is_on_campus, expires_at = EXCLUDED.expires_at,
+                is_on_campus = TRUE, expires_at = EXCLUDED.expires_at,
                 updated_at = EXCLUDED.updated_at, schedule_managed = FALSE, manual_override_off = FALSE
-        """, (user_id, req.is_on_campus, expires_at, now_unix))
+        """, (user_id, expires_at, now_unix))
+
+    else:
+        # Manual OFF outside scheduled time
+        cur.execute("""
+            INSERT INTO campus_status (user_id, is_on_campus, expires_at, updated_at, schedule_managed, manual_override_off)
+            VALUES (%s, FALSE, NULL, %s, FALSE, FALSE)
+            ON CONFLICT (user_id) DO UPDATE SET
+                is_on_campus = FALSE, expires_at = NULL,
+                updated_at = EXCLUDED.updated_at, schedule_managed = FALSE, manual_override_off = FALSE
+        """, (user_id, now_unix))
 
     conn.commit(); cur.close(); conn.close()
     return {"message": "Status updated."}
@@ -526,23 +539,24 @@ def remove_friend(friendship_id: int, user_id: int = Depends(get_current_user)):
     return {"message": "Removed."}
 
 @app.get("/users/search")
-def search_users(q: str, user_id: int = Depends(get_current_user)):
-    """Search users by display name or username."""
+def search_users(q: str = "", user_id: int = Depends(get_current_user)):
+    """Search users by display name or username. Returns all users if q is empty."""
     conn = get_db(); cur = conn.cursor()
-    cur.execute("""
+    where_clause = "WHERE u.id != %s" if not q.strip() else "WHERE u.id != %s AND (LOWER(u.display_name) LIKE LOWER(%s) OR LOWER(u.username) LIKE LOWER(%s))"
+    params = (user_id,) if not q.strip() else (user_id, f"%{q}%", f"%{q}%")
+    cur.execute(f"""
         SELECT u.id, u.display_name, u.username,
-               f.id as friendship_id, f.status, f.requester_id
+               f.id as friendship_id, f.status,
+               f.requester_id, f.addressee_id
         FROM users u
         LEFT JOIN friendships f ON (
             (f.requester_id = %s AND f.addressee_id = u.id) OR
             (f.addressee_id = %s AND f.requester_id = u.id)
         )
-        WHERE u.id != %s AND (
-            LOWER(u.display_name) LIKE LOWER(%s) OR
-            LOWER(u.username) LIKE LOWER(%s)
-        )
-        LIMIT 20
-    """, (user_id, user_id, user_id, f"%{q}%", f"%{q}%"))
+        {where_clause}
+        ORDER BY u.display_name ASC
+        LIMIT 50
+    """, (user_id, user_id) + params)
     rows = cur.fetchall(); cur.close(); conn.close()
     return [dict(r) for r in rows]
 
