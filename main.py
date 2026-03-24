@@ -69,10 +69,22 @@ def init_db():
             day_of_week INTEGER NOT NULL,
             start_time TEXT NOT NULL,
             end_time TEXT NOT NULL,
-            label TEXT DEFAULT ''
+            label TEXT DEFAULT '',
+            is_recurring BOOLEAN NOT NULL DEFAULT TRUE,
+            specific_date TEXT DEFAULT NULL
         )
     """)
     conn.commit()
+    # Migration: safely add new columns for anyone upgrading from the old schema
+    for migration in [
+        "ALTER TABLE schedule ADD COLUMN IF NOT EXISTS is_recurring BOOLEAN NOT NULL DEFAULT TRUE",
+        "ALTER TABLE schedule ADD COLUMN IF NOT EXISTS specific_date TEXT DEFAULT NULL",
+    ]:
+        try:
+            cur.execute(migration)
+            conn.commit()
+        except Exception:
+            conn.rollback()
     cur.close()
     conn.close()
 
@@ -260,18 +272,67 @@ def delete_account(user_id: int = Depends(get_current_user)):
 # ---------- SCHEDULE ROUTES ----------
 
 class ScheduleEntry(BaseModel):
-    day_of_week: int        # 0=Monday, 6=Sunday
-    start_time: str         # "HH:MM" 24hr format
-    end_time: str           # "HH:MM" 24hr format
+    day_of_week: int          # 0=Monday, 6=Sunday
+    start_time: str           # "HH:MM" 24hr
+    end_time: str             # "HH:MM" 24hr
     label: Optional[str] = ""
+    is_recurring: bool = True          # True = every week, False = one-off
+    specific_date: Optional[str] = None  # "YYYY-MM-DD", required if one-off
+
+def check_and_apply_schedule(user_id: int, conn):
+    """
+    Look at the user's schedule and automatically set their campus status
+    if the current time falls within any active slot.
+    - Recurring slots match any week on that day.
+    - One-off slots only match their specific date.
+    If inside a slot, status is set ON with expiry at the slot's end time.
+    If no slot matches, status is left alone (don't force them off if they manually turned on).
+    """
+    from datetime import datetime, date
+    now = datetime.now()
+    today_dow = (now.weekday())  # 0=Monday
+    today_str = now.strftime("%Y-%m-%d")
+    current_time = now.strftime("%H:%M")
+
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, start_time, end_time, is_recurring, specific_date
+        FROM schedule
+        WHERE user_id = %s
+          AND day_of_week = %s
+          AND start_time <= %s
+          AND end_time > %s
+    """, (user_id, today_dow, current_time, current_time))
+    slots = cur.fetchall()
+
+    for slot in slots:
+        # Check if this slot applies today
+        if slot["is_recurring"] or slot["specific_date"] == today_str:
+            # Calculate unix timestamp for when this slot ends today
+            end_h, end_m = map(int, slot["end_time"].split(":"))
+            end_dt = now.replace(hour=end_h, minute=end_m, second=0, microsecond=0)
+            expires_at = end_dt.timestamp()
+
+            cur.execute("""
+                INSERT INTO campus_status (user_id, is_on_campus, expires_at, updated_at)
+                VALUES (%s, TRUE, %s, %s)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    is_on_campus = TRUE,
+                    expires_at = EXCLUDED.expires_at,
+                    updated_at = EXCLUDED.updated_at
+            """, (user_id, expires_at, time.time()))
+            conn.commit()
+            break  # One matching slot is enough
+    cur.close()
 
 @app.get("/schedule")
 def get_my_schedule(user_id: int = Depends(get_current_user)):
-    """Get the current user's weekly schedule."""
+    """Get the current user's weekly schedule and auto-apply status if in a slot."""
     conn = get_db()
+    check_and_apply_schedule(user_id, conn)
     cur = conn.cursor()
     cur.execute(
-        "SELECT id, day_of_week, start_time, end_time, label FROM schedule WHERE user_id = %s ORDER BY day_of_week, start_time",
+        "SELECT id, day_of_week, start_time, end_time, label, is_recurring, specific_date FROM schedule WHERE user_id = %s ORDER BY day_of_week, start_time",
         (user_id,)
     )
     rows = cur.fetchall()
@@ -282,13 +343,19 @@ def get_my_schedule(user_id: int = Depends(get_current_user)):
 @app.post("/schedule")
 def add_schedule_entry(entry: ScheduleEntry, user_id: int = Depends(get_current_user)):
     """Add a scheduled campus time."""
+    if not entry.is_recurring and not entry.specific_date:
+        raise HTTPException(status_code=400, detail="One-off entries require a specific_date.")
     conn = get_db()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO schedule (user_id, day_of_week, start_time, end_time, label) VALUES (%s, %s, %s, %s, %s) RETURNING id",
-        (user_id, entry.day_of_week, entry.start_time, entry.end_time, entry.label or "")
+        """INSERT INTO schedule (user_id, day_of_week, start_time, end_time, label, is_recurring, specific_date)
+           VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id""",
+        (user_id, entry.day_of_week, entry.start_time, entry.end_time,
+         entry.label or "", entry.is_recurring, entry.specific_date)
     )
     new_id = cur.fetchone()["id"]
+    # Immediately apply status if this slot is active right now
+    check_and_apply_schedule(user_id, conn)
     conn.commit()
     cur.close()
     conn.close()
@@ -296,7 +363,7 @@ def add_schedule_entry(entry: ScheduleEntry, user_id: int = Depends(get_current_
 
 @app.delete("/schedule/{entry_id}")
 def delete_schedule_entry(entry_id: int, user_id: int = Depends(get_current_user)):
-    """Delete a schedule entry (only if it belongs to the current user)."""
+    """Delete a schedule entry."""
     conn = get_db()
     cur = conn.cursor()
     cur.execute(
@@ -313,11 +380,12 @@ def delete_schedule_entry(entry_id: int, user_id: int = Depends(get_current_user
 
 @app.get("/schedule/all")
 def get_all_schedules(user_id: int = Depends(get_current_user)):
-    """Get everyone's schedule so you can see who plans to be on campus."""
+    """Get everyone's schedule."""
     conn = get_db()
     cur = conn.cursor()
     cur.execute("""
         SELECT s.id, s.day_of_week, s.start_time, s.end_time, s.label,
+               s.is_recurring, s.specific_date,
                u.display_name, u.id as uid
         FROM schedule s
         JOIN users u ON s.user_id = u.id
