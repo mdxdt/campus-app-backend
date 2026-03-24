@@ -486,15 +486,16 @@ def get_friends(user_id: int = Depends(get_current_user)):
     """Get accepted friends with their campus status, and pending requests."""
     conn = get_db(); cur = conn.cursor()
     cur.execute("""
-        SELECT f.id, f.status, f.requester_id,
+        SELECT f.id, f.status, f.requester_id, f.addressee_id,
                u.id as other_id, u.display_name,
-               COALESCE(cs.is_on_campus, FALSE) as is_on_campus, cs.expires_at
+               COALESCE(cs.is_on_campus, FALSE) as is_on_campus, cs.expires_at,
+               (f.requester_id = %s) as i_sent_this
         FROM friendships f
         JOIN users u ON u.id = CASE WHEN f.requester_id = %s THEN f.addressee_id ELSE f.requester_id END
         LEFT JOIN campus_status cs ON cs.user_id = u.id
         WHERE f.requester_id = %s OR f.addressee_id = %s
         ORDER BY f.status, u.display_name
-    """, (user_id, user_id, user_id))
+    """, (user_id, user_id, user_id, user_id))
     rows = cur.fetchall(); cur.close(); conn.close()
     return [dict(r) for r in rows]
 
