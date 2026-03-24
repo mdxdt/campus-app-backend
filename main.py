@@ -62,6 +62,16 @@ def init_db():
             updated_at DOUBLE PRECISION NOT NULL
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS schedule (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            day_of_week INTEGER NOT NULL,
+            start_time TEXT NOT NULL,
+            end_time TEXT NOT NULL,
+            label TEXT DEFAULT ''
+        )
+    """)
     conn.commit()
     cur.close()
     conn.close()
@@ -245,3 +255,75 @@ def delete_account(user_id: int = Depends(get_current_user)):
     return {"message": "Account deleted."}
 
 # Run with: uvicorn main:app --reload
+
+
+# ---------- SCHEDULE ROUTES ----------
+
+class ScheduleEntry(BaseModel):
+    day_of_week: int        # 0=Monday, 6=Sunday
+    start_time: str         # "HH:MM" 24hr format
+    end_time: str           # "HH:MM" 24hr format
+    label: Optional[str] = ""
+
+@app.get("/schedule")
+def get_my_schedule(user_id: int = Depends(get_current_user)):
+    """Get the current user's weekly schedule."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, day_of_week, start_time, end_time, label FROM schedule WHERE user_id = %s ORDER BY day_of_week, start_time",
+        (user_id,)
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [dict(r) for r in rows]
+
+@app.post("/schedule")
+def add_schedule_entry(entry: ScheduleEntry, user_id: int = Depends(get_current_user)):
+    """Add a scheduled campus time."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO schedule (user_id, day_of_week, start_time, end_time, label) VALUES (%s, %s, %s, %s, %s) RETURNING id",
+        (user_id, entry.day_of_week, entry.start_time, entry.end_time, entry.label or "")
+    )
+    new_id = cur.fetchone()["id"]
+    conn.commit()
+    cur.close()
+    conn.close()
+    return {"id": new_id, "message": "Schedule entry added."}
+
+@app.delete("/schedule/{entry_id}")
+def delete_schedule_entry(entry_id: int, user_id: int = Depends(get_current_user)):
+    """Delete a schedule entry (only if it belongs to the current user)."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "DELETE FROM schedule WHERE id = %s AND user_id = %s RETURNING id",
+        (entry_id, user_id)
+    )
+    deleted = cur.fetchone()
+    conn.commit()
+    cur.close()
+    conn.close()
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Entry not found.")
+    return {"message": "Deleted."}
+
+@app.get("/schedule/all")
+def get_all_schedules(user_id: int = Depends(get_current_user)):
+    """Get everyone's schedule so you can see who plans to be on campus."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT s.id, s.day_of_week, s.start_time, s.end_time, s.label,
+               u.display_name, u.id as uid
+        FROM schedule s
+        JOIN users u ON s.user_id = u.id
+        ORDER BY s.day_of_week, s.start_time
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [dict(r) for r in rows]
